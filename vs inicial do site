@@ -1,0 +1,3357 @@
+node_modules/
+.DS_Store
+*.log
+data.json
+email-outbox.json
+__pycache__/
+*.pyc
+
+const SESSION_KEY = "necrobet.session.v1";
+const LOGO_SRC = "NecroBET-logo_v3.png";
+
+const seed = {
+  users: [],
+  leagues: [],
+  people: [
+    {
+      name: "Pessoa Publica Demo",
+      type: "publica",
+      image: LOGO_SRC,
+      source: "demo",
+      status: "Vivo",
+    },
+  ],
+  picks: [],
+};
+
+let state = clone(seed);
+let view = {
+  tab: "ligas",
+  modal: null,
+  selectedLeagueId: null,
+  pendingPickName: "",
+  publicFigureAnswer: "",
+  publicFigureDetails: "",
+  showPublicRefine: false,
+  identifying: false,
+  candidateResults: [],
+  authMode: "login",
+  pendingEmail: "",
+  generatedCode: "",
+  loading: true,
+  pendingJoinCode: new URLSearchParams(window.location.search).get("join") || "",
+  leagueView: "mine",
+  joinQuery: "",
+  rankingView: "picks",
+};
+
+let session = loadSession();
+
+function loadSession() {
+  const raw = localStorage.getItem(SESSION_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(nextSession) {
+  session = nextSession;
+  if (nextSession) {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}
+
+async function loadState() {
+  view.loading = true;
+  render();
+  try {
+    const response = await fetch("api/state", { cache: "no-store" });
+    if (!response.ok) throw new Error("state");
+    const data = await response.json();
+    state = { ...clone(seed), ...data };
+    view.selectedLeagueId = view.selectedLeagueId || userLeagues()[0]?.id || null;
+    await autoJoinFromInvite();
+  } catch {
+    toast("Nao consegui carregar o arquivo data.json.");
+  } finally {
+    view.loading = false;
+    render();
+  }
+}
+
+async function saveState() {
+  const response = await fetch("api/state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state),
+  });
+  if (!response.ok) {
+    toast("Nao consegui salvar no data.json.");
+    throw new Error("save");
+  }
+}
+
+async function apiPost(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({ ok: false }));
+  return response.ok ? data : { ok: false, ...data };
+}
+
+async function persistAndRender() {
+  await saveState();
+  render();
+}
+
+function uid(prefix) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function usersPlusIcon() {
+  return `
+    <svg class="users-plus-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M15 19.5v-1.2c0-1.7-1.4-3.1-3.1-3.1H6.6c-1.7 0-3.1 1.4-3.1 3.1v1.2" />
+      <path d="M9.2 11.5a3.1 3.1 0 1 0 0-6.2 3.1 3.1 0 0 0 0 6.2Z" />
+      <path d="M17.5 8v6" />
+      <path d="M14.5 11h6" />
+    </svg>`;
+}
+
+function leaveLeagueIcon() {
+  return `
+    <svg class="leave-league-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M9 5H5.8c-.9 0-1.6.7-1.6 1.6v10.8c0 .9.7 1.6 1.6 1.6H9" />
+      <path d="M14.5 8l4 4-4 4" />
+      <path d="M18.5 12H8.8" />
+    </svg>`;
+}
+
+function joinLeagueIcon() {
+  return `
+    <svg class="join-league-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 12h11" />
+      <path d="M12 8l4 4-4 4" />
+      <path d="M19 5v14" />
+    </svg>`;
+}
+
+function enterLeagueIcon() {
+  return `
+    <svg class="enter-league-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 12h12" />
+      <path d="M13 7l5 5-5 5" />
+    </svg>`;
+}
+
+function normalizePersonKey(name) {
+  return String(name || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function personByName(name) {
+  const key = normalizePersonKey(name);
+  return state.people.find((person) => normalizePersonKey(person.name) === key) || null;
+}
+
+function personStatus(person) {
+  return person?.status === "Falecido" ? "Falecido" : "Vivo";
+}
+
+function statusChipHtml(status) {
+  const safeStatus = status === "Falecido" ? "Falecido" : "Vivo";
+  return `<span class="status-chip ${safeStatus === "Falecido" ? "dead" : "alive"}">${safeStatus}</span>`;
+}
+
+function classificationChipHtml(classification) {
+  return classification ? `<span class="chip">${escapeHtml(classification)}</span>` : "";
+}
+
+function personPickCount(personName) {
+  const key = normalizePersonKey(personName);
+  return state.picks.filter((pick) => normalizePersonKey(pick.personName) === key).length;
+}
+
+function personOdd(leagueId, personName) {
+  const odd = 1 - Math.max(0, personPickCount(personName) - 1) * 0.05;
+  return Math.max(0.05, odd).toFixed(2);
+}
+
+function userLabel(userId) {
+  const user = state.users.find((item) => item.id === userId);
+  return user?.name || userEmailLabel(user) || "Participante";
+}
+
+function leagueParticipantIds(league) {
+  const ids = new Set(league.members || []);
+  state.picks
+    .filter((pick) => pick.leagueId === league.id)
+    .forEach((pick) => ids.add(pick.userId));
+  return [...ids];
+}
+
+function leagueUserScore(leagueId, userId) {
+  return state.picks
+    .filter((pick) => pick.leagueId === leagueId && pick.userId === userId)
+    .reduce((score, pick) => {
+      const person = personByName(pick.personName);
+      if (personStatus(person) !== "Falecido") return score;
+      return score + Number(personOdd(leagueId, pick.personName));
+    }, 0);
+}
+
+function leagueStandings(league) {
+  return leagueParticipantIds(league)
+    .map((userId) => ({ userId, score: leagueUserScore(league.id, userId) }))
+    .sort((a, b) => b.score - a.score || userLabel(a.userId).localeCompare(userLabel(b.userId)));
+}
+
+function leagueSearchResults(query) {
+  const term = String(query || "").trim().toLowerCase();
+  if (!term) return [];
+  return state.leagues
+    .filter((league) => league.code.toLowerCase().includes(term) || league.name.toLowerCase().includes(term))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .slice(0, 8);
+}
+
+function userLeaguePosition(league, userId) {
+  const standings = leagueStandings(league);
+  const index = standings.findIndex((row) => row.userId === userId);
+  return index >= 0 ? index + 1 : standings.length || 1;
+}
+
+function isActiveLeague(league) {
+  if (!league?.expiresAt) return true;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const expires = new Date(`${league.expiresAt}T00:00:00`);
+  return Number.isNaN(expires.getTime()) || expires >= today;
+}
+
+function userTotalPicks(userId) {
+  return state.picks.filter((pick) => pick.userId === userId).length;
+}
+
+function userTotalScore(userId) {
+  return state.leagues
+    .filter((league) => isActiveLeague(league) && leagueParticipantIds(league).includes(userId))
+    .reduce((total, league) => total + leagueUserScore(league.id, userId), 0);
+}
+
+function oddChipHtml(leagueId, personName) {
+  return `<span class="odd-chip">Odd: ${personOdd(leagueId, personName)}</span>`;
+}
+
+function currentUser() {
+  return state.users.find((user) => user.id === session?.userId) || null;
+}
+
+function userLeagues() {
+  const user = currentUser();
+  if (!user) return [];
+  return state.leagues.filter((league) => league.members.includes(user.id));
+}
+
+function currentLeague() {
+  return state.leagues.find((league) => league.id === view.selectedLeagueId) || userLeagues()[0] || null;
+}
+
+function leaguePicks(leagueId, userOnly = true) {
+  return state.picks.filter((pick) => {
+    const sameLeague = pick.leagueId === leagueId;
+    const sameUser = !userOnly || pick.userId === session?.userId;
+    return sameLeague && sameUser;
+  });
+}
+
+function appHtml() {
+  if (view.loading) return loadingHtml();
+  if (!session || !currentUser()) return authHtml();
+  if (view.tab === "liga" && currentLeague()) return leagueDetailHtml(currentLeague());
+  return homeHtml();
+}
+
+function loadingHtml() {
+  return `
+    <section class="screen auth-screen">
+      <div class="brand">
+        <img src="${LOGO_SRC}" alt="NecroBET">
+        <div><span>Carregando data.json</span></div>
+      </div>
+    </section>`;
+}
+
+function authHtml() {
+  const codeHint = view.generatedCode ? `<p class="small">Codigo local de recuperacao: <strong>${view.generatedCode}</strong></p>` : "";
+  const forms = {
+    login: `
+      <form class="stack" data-action="login-email">
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" placeholder="voce@email.com" required>
+        </div>
+        <div class="field">
+          <label for="password">Senha</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Sua senha" required>
+        </div>
+        <button class="primary-button" type="submit">Entrar</button>
+        <button class="text-link" type="button" data-action="show-forgot">Esqueci minha senha</button>
+        <button class="text-link" type="button" data-action="show-register">Criar cadastro</button>
+      </form>`,
+    register: `
+      <form class="stack" data-action="register-email">
+        <div class="field">
+          <label for="name">Seu nome</label>
+          <input id="name" name="name" autocomplete="name" placeholder="Nome para aparecer nas ligas" required>
+        </div>
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" placeholder="voce@email.com" required>
+        </div>
+        <div class="field">
+          <label for="password">Senha</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" minlength="6" placeholder="Minimo 6 caracteres" required>
+        </div>
+        <button class="primary-button" type="submit">Cadastrar</button>
+        <button class="ghost-button" type="button" data-action="show-login">↩ Ja tenho cadastro</button>
+      </form>`,
+    forgot: `
+      <form class="stack" data-action="forgot-password">
+        <div class="field">
+          <label for="email">Email cadastrado</label>
+          <input id="email" name="email" type="email" autocomplete="email" placeholder="voce@email.com" required>
+        </div>
+        <button class="primary-button" type="submit">Gerar codigo</button>
+        <button class="ghost-button" type="button" data-action="show-login">↩ Voltar</button>
+      </form>`,
+    reset: `
+      <form class="stack" data-action="reset-password">
+        <div class="field">
+          <label for="code">Codigo recebido</label>
+          <input id="code" name="code" inputmode="numeric" maxlength="6" placeholder="000000" required>
+        </div>
+        <div class="field">
+          <label for="password">Nova senha</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" minlength="6" placeholder="Minimo 6 caracteres" required>
+        </div>
+        ${codeHint}
+        <button class="primary-button" type="submit">Alterar senha</button>
+        <button class="ghost-button" type="button" data-action="show-login">↩ Voltar</button>
+      </form>`,
+  };
+
+  return `
+    <section class="screen auth-screen">
+      <div class="auth-brand">
+        <img src="${LOGO_SRC}" alt="NecroBET">
+      </div>
+      <div class="panel stack">
+        ${forms[view.authMode] || forms.login}
+      </div>
+      <p class="login-footer">App do grupo BQTech</p>
+    </section>`;
+}
+
+function homeHtml() {
+  const user = currentUser();
+  return `
+    <section class="screen">
+      ${topbarHtml(user?.name || "", false)}
+      ${tabHtml()}
+      <nav class="bottom-nav">
+        ${navButton("ligas", "Ligas")}
+        ${navButton("ranking", "Ranking")}
+        ${navButton("perfil", "Perfil")}
+      </nav>
+      ${modalHtml()}
+    </section>`;
+}
+
+function leagueDetailHtml(league) {
+  const picks = leaguePicks(league.id);
+  const score = leagueUserScore(league.id, session?.userId);
+  const position = userLeaguePosition(league, session?.userId);
+  const totalParticipants = Math.max(1, leagueParticipantIds(league).length);
+  const views = {
+    mine: picks.length
+      ? picks.map((pick) => personCardHtml(personByName(pick.personName), pick)).join("")
+      : `<div class="empty">Nenhum palpite seu nesta liga ainda.</div>`,
+    all: leagueAllPicksHtml(league),
+    members: leagueMembersHtml(league),
+  };
+  const activeView = views[view.leagueView] ? view.leagueView : "mine";
+  return `
+    <section class="screen">
+      ${topbarHtml(league.name, true)}
+      <div class="panel stack">
+        <div class="row between">
+          <div>
+            <p class="eyebrow">Liga ativa</p>
+            <h2 class="league-name">${escapeHtml(league.name)}</h2>
+            <p class="small">Validade: ${formatDate(league.expiresAt)} | Codigo: ${league.code}</p>
+          </div>
+        </div>
+        <div class="league-scorebox">
+          <span class="odds">Palpites: ${picks.length}</span>
+          <span class="score-badge">Pontos: ${score.toFixed(2)}</span>
+          <span class="rank-badge">Rank: ${position}/${totalParticipants}</span>
+        </div>
+        <div class="league-action-grid">
+          <button class="league-icon-action bet-image-button" data-modal="pick" title="Adicionar palpite" aria-label="Adicionar palpite">
+            <img src="Logo-bet_v2.png" alt="">
+          </button>
+          <button class="league-icon-action add-users-button" data-modal="invite" data-id="${league.id}" title="Adicionar usuarios" aria-label="Adicionar usuarios">
+            ${usersPlusIcon()}
+          </button>
+          <button class="league-icon-action whatsapp-button" data-action="share-league" data-id="${league.id}" title="Compartilhar no WhatsApp" aria-label="Compartilhar no WhatsApp">
+            <img class="whatsapp-icon" src="WhatsApp_icon.png" alt="" />
+          </button>
+          <button class="league-icon-action leave-league-button" data-action="leave-league" data-id="${league.id}" title="Sair da liga" aria-label="Sair da liga">
+            ${leaveLeagueIcon()}
+          </button>
+        </div>
+      </div>
+      <div class="tabs league-tabs" style="margin-top: 12px;">
+        <button class="tab ${activeView === "mine" ? "active" : ""}" data-league-view="mine">Meus</button>
+        <button class="tab ${activeView === "all" ? "active" : ""}" data-league-view="all">Todos</button>
+        <button class="tab ${activeView === "members" ? "active" : ""}" data-league-view="members">Membros</button>
+      </div>
+      <div class="stack" style="margin-top: 12px;">
+        ${views[activeView]}
+      </div>
+      ${modalHtml()}
+    </section>`;
+}
+
+function topbarHtml(title, showBack) {
+  return `
+    <header class="topbar row between">
+      <div class="brand">
+        <img src="${LOGO_SRC}" alt="NecroBET">
+        <div>
+          <h1>${escapeHtml(title || "NecroBET")}</h1>
+          <span>${showBack ? "Dentro da liga" : "NecroBET"}</span>
+        </div>
+      </div>
+      ${showBack ? `<button class="icon-button" title="Voltar" data-tab="ligas" aria-label="Voltar">↩</button>` : `<button class="icon-button" title="Sair" data-action="logout">Sair</button>`}
+    </header>`;
+}
+
+function summaryHtml() {
+  const leagues = userLeagues();
+  const totalPicks = userTotalPicks(session?.userId);
+  const totalScore = userTotalScore(session?.userId);
+  return `
+    <div class="panel stack">
+      <div class="metric-grid">
+        <div class="metric"><strong>${leagues.length}</strong><span class="small">ligas</span></div>
+        <div class="metric"><strong>${totalPicks}</strong><span class="small">palpites</span></div>
+        <div class="metric"><strong>${totalScore.toFixed(2)}</strong><span class="small">pontos</span></div>
+      </div>
+    </div>`;
+}
+
+function tabHtml() {
+  if (view.tab === "ligas") return leaguesHtml();
+  if (view.tab === "ranking") return rankingHtml();
+  return profileHtml();
+}
+
+function navButton(id, label) {
+  return `<button class="nav-item ${view.tab === id ? "active" : ""}" data-tab="${id}">${label}</button>`;
+}
+
+function leaguesHtml() {
+  const leagues = userLeagues();
+  return `
+    <div class="stack" style="margin-top: 12px;">
+      ${summaryHtml()}
+      <div class="row">
+        <button class="primary-button" data-modal="league">Criar liga</button>
+        <button class="ghost-button" data-modal="join">Acessar</button>
+      </div>
+      ${
+        leagues.length
+          ? leagues.map(leagueCardHtml).join("")
+          : `<div class="empty">Crie ou acesse uma liga para registrar palpites.</div>`
+      }
+    </div>`;
+}
+
+function leagueCardHtml(league) {
+  const active = currentLeague()?.id === league.id ? "active" : "";
+  return `
+    <article class="league-card ${active}" data-action="open-league" data-id="${league.id}">
+      <div class="row between">
+        <div>
+          <h3 class="league-name">${escapeHtml(league.name)}</h3>
+          <p class="small">Validade: ${formatDate(league.expiresAt)}</p>
+        </div>
+        <span class="odds">${league.code}</span>
+      </div>
+      <div class="chip-row">
+        <span class="chip">${league.members.length} participantes</span>
+        <span class="chip">${leaguePicks(league.id).length} palpites seus</span>
+      </div>
+      <button class="primary-button league-enter-button" data-action="open-league" data-id="${league.id}">
+        Entrar na liga ${enterLeagueIcon()}
+      </button>
+    </article>`;
+}
+
+function personCardHtml(person, pick, showOwner = false) {
+  const image = person?.image || initialsImage(pick.personName);
+  const classification = classificationChipHtml(person?.classification);
+  const canDelete = pick.userId === session?.userId;
+  const owner = showOwner ? `<p class="small">Palpite de ${escapeHtml(userLabel(pick.userId))}</p>` : "";
+  const status = personStatus(person);
+  return `
+    <article class="person-card">
+      <img class="avatar" src="${image}" alt="">
+      <div>
+        <h3 class="person-name">${escapeHtml(pick.personName)}</h3>
+        ${owner}
+        <div class="chip-row">${statusChipHtml(status)}${classification}${oddChipHtml(pick.leagueId, pick.personName)}</div>
+      </div>
+      <div class="pick-actions">
+        ${canDelete ? `<button class="delete-pick-button" title="Excluir palpite" data-action="delete-pick" data-id="${escapeHtml(pick.id)}">Excluir</button>` : ""}
+      </div>
+    </article>`;
+}
+
+function leagueAllPicksHtml(league) {
+  const groups = new Map();
+  const allPicks = state.picks.filter((pick) => pick.leagueId === league.id);
+  for (const pick of allPicks) {
+    const key = normalizePersonKey(pick.personName);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        personName: pick.personName,
+        person: personByName(pick.personName),
+        picks: [],
+      });
+    }
+    groups.get(key).picks.push(pick);
+  }
+
+  const rows = [...groups.values()].sort((a, b) => {
+    const countDiff = b.picks.length - a.picks.length;
+    return countDiff || a.personName.localeCompare(b.personName);
+  });
+
+  if (!rows.length) return `<div class="empty">Nenhum palpite cadastrado nesta liga ainda.</div>`;
+
+  return rows
+    .map((row) => {
+      const image = row.person?.image || initialsImage(row.personName);
+      const uniqueUsers = [...new Map(row.picks.map((pick) => [pick.userId, pick])).values()];
+      const owners = uniqueUsers
+        .map((pick) => `<span class="member-chip">${escapeHtml(userLabel(pick.userId))}</span>`)
+        .join("");
+      const classification = classificationChipHtml(row.person?.classification);
+      const status = personStatus(row.person);
+      return `
+        <article class="grouped-pick-card">
+          <img class="avatar" src="${image}" alt="">
+          <div class="grouped-pick-body">
+            <div class="row between">
+              <div>
+                <h3 class="person-name">${escapeHtml(row.personName)}</h3>
+                <p class="small">${row.picks.length} indicacao(oes) | ${uniqueUsers.length} participante(s)</p>
+              </div>
+            </div>
+            <div class="chip-row">${statusChipHtml(status)}${classification}${oddChipHtml(league.id, row.personName)}</div>
+            <div class="pick-owner-list">${owners}</div>
+          </div>
+        </article>`;
+    })
+    .join("");
+}
+
+function leagueMembersHtml(league) {
+  const participantIds = leagueParticipantIds(league);
+  if (!participantIds.length) return `<div class="empty">Nenhum membro nesta liga ainda.</div>`;
+  const standings = leagueStandings(league);
+
+  return participantIds
+    .sort((a, b) => {
+      const rankA = standings.findIndex((row) => row.userId === a);
+      const rankB = standings.findIndex((row) => row.userId === b);
+      return rankA - rankB;
+    })
+    .map((memberId) => {
+      const picks = state.picks.filter((pick) => pick.leagueId === league.id && pick.userId === memberId);
+      const rank = userLeaguePosition(league, memberId);
+      const score = leagueUserScore(league.id, memberId);
+      const pickList = picks.length
+        ? picks
+            .map((pick) => {
+              const person = personByName(pick.personName);
+              const image = person?.image || initialsImage(pick.personName);
+              const status = personStatus(person);
+              const classification = classificationChipHtml(person?.classification);
+              return `
+                <div class="member-pick-row">
+                  <img class="mini-avatar" src="${image}" alt="">
+                  <div class="member-pick-info">
+                    <strong>${escapeHtml(pick.personName)}</strong>
+                    <div class="chip-row">${statusChipHtml(status)}${classification}${oddChipHtml(league.id, pick.personName)}</div>
+                  </div>
+                </div>`;
+            })
+            .join("")
+        : `<p class="small">Ainda nao cadastrou palpites.</p>`;
+      return `
+        <article class="member-card">
+          <div class="row between">
+            <div>
+              <h3 class="person-name">${escapeHtml(userLabel(memberId))}</h3>
+              <p class="small">Rank: ${rank} | Pontos: ${score.toFixed(2)} | ${picks.length} palpite(s)</p>
+            </div>
+            <div class="member-card-badges">
+              ${memberId === league.ownerId ? `<span class="chip">Dono</span>` : ""}
+              <span class="count-badge">${picks.length}</span>
+            </div>
+          </div>
+          <div class="member-picks">${pickList}</div>
+        </article>`;
+    })
+    .join("");
+}
+
+function rankingHtml() {
+  const activeView = view.rankingView === "players" ? "players" : "picks";
+  return `
+    <div class="tabs ranking-tabs" style="margin-top: 12px;">
+      <button class="tab ${activeView === "picks" ? "active" : ""}" data-ranking-view="picks">Palpites</button>
+      <button class="tab ${activeView === "players" ? "active" : ""}" data-ranking-view="players">Jogadores</button>
+    </div>
+    ${activeView === "players" ? rankingPlayersHtml() : rankingPicksHtml()}`;
+}
+
+function rankingPicksHtml() {
+  const groups = new Map();
+  for (const pick of state.picks) {
+    const key = normalizePersonKey(pick.personName);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        name: pick.personName,
+        person: personByName(pick.personName),
+        pickIds: new Set(),
+        leagueIds: new Set(),
+        userIds: new Set(),
+      });
+    }
+    const group = groups.get(key);
+    group.pickIds.add(pick.id);
+    group.leagueIds.add(pick.leagueId);
+    group.userIds.add(pick.userId);
+  }
+  const rows = [...groups.values()].sort((a, b) => b.pickIds.size - a.pickIds.size || a.name.localeCompare(b.name));
+  if (!rows.length) return `<div class="empty">O ranking aparece quando houver palpites cadastrados.</div>`;
+  return `
+    <div class="stack" style="margin-top: 12px;">
+      ${rows
+        .map(
+          (row, index) => `
+        <article class="ranking-card">
+          <img class="avatar" src="${row.person?.image || initialsImage(row.name)}" alt="">
+          <div>
+            <strong>#${index + 1} ${escapeHtml(row.name)}</strong>
+            <p class="small">${row.pickIds.size} indicacao(oes) em ${row.leagueIds.size} liga(s)</p>
+            <div class="chip-row">${statusChipHtml(personStatus(row.person))}${classificationChipHtml(row.person?.classification)}${oddChipHtml("", row.name)}</div>
+          </div>
+          <span class="count-badge">${row.pickIds.size}</span>
+        </article>`
+        )
+        .join("")}
+    </div>`;
+}
+
+function rankingPlayersHtml() {
+  const activeLeagues = state.leagues.filter(isActiveLeague);
+  const playerIds = new Set();
+  activeLeagues.forEach((league) => leagueParticipantIds(league).forEach((userId) => playerIds.add(userId)));
+  const rows = [...playerIds]
+    .map((userId) => {
+      const leagues = activeLeagues.filter((league) => leagueParticipantIds(league).includes(userId));
+      return {
+        userId,
+        name: userLabel(userId),
+        score: userTotalScore(userId),
+        picks: state.picks.filter((pick) => pick.userId === userId && leagues.some((league) => league.id === pick.leagueId)).length,
+        leagues: leagues.length,
+      };
+    })
+    .sort((a, b) => b.score - a.score || b.picks - a.picks || a.name.localeCompare(b.name))
+    .slice(0, 20);
+
+  if (!rows.length) return `<div class="empty">O ranking de jogadores aparece quando houver ligas ativas.</div>`;
+
+  return `
+    <div class="stack" style="margin-top: 12px;">
+      ${rows
+        .map(
+          (row, index) => `
+        <article class="player-ranking-card">
+          <div>
+            <strong>#${index + 1} ${escapeHtml(row.name)}</strong>
+            <p class="small">${row.picks} palpite(s) em ${row.leagues} liga(s) ativa(s)</p>
+          </div>
+          <span class="score-badge">${row.score.toFixed(2)}</span>
+        </article>`
+        )
+        .join("")}
+    </div>`;
+}
+
+function profileHtml() {
+  const user = currentUser();
+  return `
+    <div class="stack" style="margin-top: 12px;">
+      <div class="panel stack">
+        <h2 class="league-name">${escapeHtml(user?.name || "")}</h2>
+        <p class="small">${escapeHtml(userEmailLabel(user))}</p>
+        <form class="stack" data-action="update-profile">
+          <div class="field">
+            <label for="profile-name">Nome exibido</label>
+            <input id="profile-name" name="name" value="${escapeHtml(user?.name || "")}" autocomplete="name" required>
+          </div>
+          <button class="primary-button" type="submit">Salvar nome</button>
+        </form>
+        <button class="danger-button" data-action="logout">Sair</button>
+      </div>
+    </div>`;
+}
+
+function modalHtml() {
+  if (!view.modal) return "";
+  const content = {
+    league: leagueModal(),
+    join: joinModal(),
+    invite: inviteModal(),
+    pick: pickModal(),
+    identify: identifyModal(),
+  }[view.modal.type];
+  return `
+    <div class="modal-backdrop" data-action="close-modal">
+      <div class="modal stack" role="dialog" aria-modal="true">
+        <button class="icon-button modal-back-button" title="Voltar" data-action="close-modal" aria-label="Voltar">↩</button>
+        ${content}
+      </div>
+    </div>`;
+}
+
+function leagueModal() {
+  return `
+    <h2 class="league-name">Nova liga</h2>
+    <form class="stack" data-action="create-league">
+      <div class="field">
+        <label for="league-name">Nome</label>
+        <input id="league-name" name="name" placeholder="Amigos 2026" required>
+      </div>
+      <div class="field">
+        <label for="expires">Data de validade</label>
+        <input id="expires" name="expires" type="date" required>
+      </div>
+      <button class="primary-button" type="submit">Criar e entrar</button>
+      <button class="ghost-button" type="button" data-action="close-modal">Cancelar</button>
+    </form>`;
+}
+
+function joinModal() {
+  const results = leagueSearchResults(view.joinQuery);
+  return `
+    <h2 class="league-name">Acessar liga</h2>
+    <form class="stack" data-action="join-league-search">
+      <div class="field">
+        <label for="code">Codigo ou nome da liga</label>
+        <input id="code" name="code" value="${escapeHtml(view.joinQuery)}" placeholder="NB1234 ou nome da liga" data-action="join-query" required>
+      </div>
+      <button class="primary-button" type="submit">Pesquisar</button>
+      <button class="ghost-button" type="button" data-action="close-modal">Cancelar</button>
+    </form>
+    <div class="stack">
+      ${
+        view.joinQuery
+          ? results.length
+            ? results.map(joinResultCardHtml).join("")
+            : `<div class="empty">Nenhuma liga encontrada.</div>`
+          : `<p class="small">Digite parte do codigo ou do nome para procurar.</p>`
+      }
+    </div>`;
+}
+
+function joinResultCardHtml(league) {
+  return `
+    <article class="join-result-card">
+      <div>
+        <h3 class="league-name">${escapeHtml(league.name)}</h3>
+        <p class="small">Codigo: ${escapeHtml(league.code)} | ${league.members.length} participante(s)</p>
+      </div>
+      <button class="icon-button join-result-button" data-action="join-result" data-code="${escapeHtml(league.code)}" title="Ingressar" aria-label="Ingressar">
+        ${joinLeagueIcon()}
+      </button>
+    </article>`;
+}
+
+function inviteModal() {
+  return `
+    <h2 class="league-name">Adicionar participantes</h2>
+    <p class="small">Use contatos do aparelho quando disponivel ou informe um email manualmente.</p>
+    <form class="stack" data-action="invite-email">
+      <button class="primary-button" type="button" data-action="pick-contacts">Buscar contatos</button>
+      <div class="field">
+        <label for="invite-email">Email</label>
+        <input id="invite-email" name="email" type="email" placeholder="convidado@email.com">
+      </div>
+      <button class="ghost-button" type="submit">Adicionar email</button>
+      <button class="ghost-button" type="button" data-action="close-modal">Fechar</button>
+    </form>`;
+}
+
+function pickModal() {
+  const league = currentLeague();
+  const options = state.people.map((person) => `<option value="${escapeHtml(person.name)}"></option>`).join("");
+  return `
+    <h2 class="league-name">Novo palpite</h2>
+    <p class="small">Liga: ${escapeHtml(league?.name || "")}</p>
+    <form class="stack" data-action="add-pick">
+      <div class="field">
+        <label for="person">Nome da pessoa</label>
+        <input id="person" name="person" list="people-list" autocomplete="off" placeholder="Digite ou escolha" required>
+        <datalist id="people-list">${options}</datalist>
+      </div>
+      <p class="small">O app vai buscar candidatos publicos e pedir confirmacao antes de salvar.</p>
+      <button class="primary-button" type="submit">Buscar</button>
+    </form>`;
+}
+
+function identifyModal() {
+  const name = view.pendingPickName;
+  const league = currentLeague();
+  const candidates = view.candidateResults || [];
+  const noCandidates = candidates.length === 0;
+  const shouldAsk = noCandidates || view.showPublicRefine;
+  if (view.identifying) {
+    return `
+      <h2 class="league-name">Buscando ${escapeHtml(name)}</h2>
+      <p class="small">Liga: ${escapeHtml(league?.name || "")}</p>
+      <div class="loading-box">
+        <div class="hourglass">⌛</div>
+        <p>Consultando a Wikipedia...</p>
+      </div>`;
+  }
+  return `
+    <h2 class="league-name">Quem e ${escapeHtml(name)}?</h2>
+    <p class="small">Liga: ${escapeHtml(league?.name || "")}</p>
+    <div class="stack">
+      ${
+        !shouldAsk
+          ? candidates.map(candidateCardHtml).join("")
+          : publicFigurePromptHtml(name)
+      }
+      ${!shouldAsk ? `<button class="ghost-button" data-action="show-public-refine">Nao e nenhuma dessas</button>` : ""}
+      <button class="ghost-button" data-action="save-private-person">Salvar como contato privado</button>
+      <button class="ghost-button" data-modal="pick">Buscar outro nome</button>
+    </div>`;
+}
+
+function publicFigurePromptHtml(name) {
+  return `
+    <div class="empty">Nao encontrei uma pessoa publica provavel para ${escapeHtml(name)}.</div>
+    <form class="stack" data-action="refine-public-person">
+      <p class="small">Ela e uma pessoa do convivio pessoal ou uma figura publica?</p>
+      <div class="segmented">
+        <label>
+          <input type="radio" name="personScope" value="private" data-action="toggle-person-scope" required>
+          <span>Convivio</span>
+        </label>
+        <label>
+          <input type="radio" name="personScope" value="public" data-action="toggle-person-scope" required>
+          <span>Publica</span>
+        </label>
+      </div>
+      <div class="field">
+        <label for="public-category">O que ela e?</label>
+        <select id="public-category" name="category" data-public-field>
+          <option value="">Selecione se for publica</option>
+          <option value="cantor">Cantor/Cantora</option>
+          <option value="artista">Artista/Ator/Atriz</option>
+          <option value="politico">Politico/Politica</option>
+          <option value="apresentador">Apresentador/TV</option>
+          <option value="atleta">Atleta</option>
+          <option value="empresario">Empresario/Executivo</option>
+          <option value="influenciador">Influenciador</option>
+          <option value="outra figura publica">Outra figura publica</option>
+        </select>
+      </div>
+      <button class="primary-button" type="submit">Refinar busca</button>
+    </form>`;
+}
+
+function candidateCardHtml(candidate) {
+  const image = candidate.image || initialsImage(candidate.name);
+  const status = candidate.status === "Falecido" ? "Falecido" : "Vivo";
+  const disabled = status === "Falecido" ? "disabled" : "";
+  const classification = classificationChipHtml(candidate.classification || "Pessoa publica");
+  return `
+    <article class="candidate-card">
+      <img class="candidate-avatar" src="${image}" alt="">
+      <div class="candidate-body">
+        <div class="row between">
+          <h3 class="person-name">${escapeHtml(candidate.name)}</h3>
+        </div>
+        <div class="chip-row">${statusChipHtml(status)}${classification}</div>
+        <p class="small">${escapeHtml(candidate.description || candidate.source || "")}</p>
+        <button class="primary-button" data-action="choose-candidate" data-id="${escapeHtml(candidate.id)}" ${disabled}>
+          ${status === "Falecido" ? "Nao pode ser adicionado" : "Escolher esta pessoa"}
+        </button>
+      </div>
+    </article>`;
+}
+
+function render() {
+  document.querySelector("#app").innerHTML = appHtml();
+}
+
+document.addEventListener("submit", async (event) => {
+  const form = event.target.closest("form");
+  if (!form) return;
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(form).entries());
+  const action = form.dataset.action;
+  try {
+    if (action === "login-email") await loginEmail(data);
+    if (action === "register-email") await registerEmail(data);
+    if (action === "forgot-password") await forgotPassword(data.email);
+    if (action === "reset-password") await resetPassword(data);
+    if (action === "create-league") await createLeague(data);
+    if (action === "join-league-search") {
+      view.joinQuery = data.code || "";
+      render();
+    }
+    if (action === "invite-email") await inviteEmail(data.email);
+    if (action === "add-pick") await identifyPerson(data.person);
+    if (action === "refine-public-person") await refinePublicPerson(data);
+    if (action === "update-profile") await updateProfile(data);
+  } catch {
+    toast("Algo falhou ao processar a acao.");
+  }
+});
+
+document.addEventListener("click", async (event) => {
+  const target = event.target.closest("button, [data-action='open-league']");
+  if (!target) return;
+  if (target.dataset.tab) {
+    view.tab = target.dataset.tab;
+    render();
+  }
+  if (target.dataset.leagueView) {
+    view.leagueView = target.dataset.leagueView;
+    render();
+  }
+  if (target.dataset.rankingView) {
+    view.rankingView = target.dataset.rankingView;
+    render();
+  }
+  if (target.dataset.modal) {
+    view.modal = { type: target.dataset.modal, leagueId: target.dataset.id || currentLeague()?.id };
+    render();
+  }
+  if (target.dataset.action === "close-modal") {
+    view.modal = null;
+    render();
+  }
+  if (target.dataset.action === "show-login") {
+    view.authMode = "login";
+    view.generatedCode = "";
+    render();
+  }
+  if (target.dataset.action === "show-register") {
+    view.authMode = "register";
+    view.generatedCode = "";
+    render();
+  }
+  if (target.dataset.action === "show-forgot") {
+    view.authMode = "forgot";
+    view.generatedCode = "";
+    render();
+  }
+  if (target.dataset.action === "logout") {
+    saveSession(null);
+    view.tab = "ligas";
+    render();
+  }
+  if (target.dataset.action === "open-league") {
+    view.selectedLeagueId = target.dataset.id;
+    view.tab = "liga";
+    view.leagueView = "mine";
+    render();
+  }
+  if (target.dataset.action === "join-result") {
+    await joinLeague(target.dataset.code);
+  }
+  if (target.dataset.action === "pick-contacts") {
+    await pickContacts();
+  }
+  if (target.dataset.action === "choose-candidate") {
+    await addPickFromCandidate(target.dataset.id);
+  }
+  if (target.dataset.action === "save-private-person") {
+    await addPrivatePick(view.pendingPickName);
+  }
+  if (target.dataset.action === "show-public-refine") {
+    view.showPublicRefine = true;
+    render();
+  }
+  if (target.dataset.action === "delete-pick") {
+    await deletePick(target.dataset.id);
+  }
+  if (target.dataset.action === "share-league") {
+    shareLeague(target.dataset.id);
+  }
+  if (target.dataset.action === "leave-league") {
+    await leaveLeague(target.dataset.id);
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (event.target.classList.contains("modal-backdrop")) {
+    view.modal = null;
+    render();
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const target = event.target.closest("[data-action='toggle-person-scope']");
+  if (!target) return;
+  const isPrivate = target.value === "private" && target.checked;
+  document.querySelectorAll("[data-public-field]").forEach((field) => {
+    field.disabled = isPrivate;
+    if (isPrivate) field.value = "";
+  });
+});
+
+document.addEventListener("input", (event) => {
+  const target = event.target.closest("[data-action='join-query']");
+  if (!target) return;
+  view.joinQuery = target.value;
+  render();
+  const input = document.querySelector("[data-action='join-query']");
+  if (input) {
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+});
+
+async function loginEmail({ email, password }) {
+  const result = await apiPost("api/auth/login", { email, password });
+  if (!result.ok) return toast(result.error || "Email ou senha invalidos.");
+  state = { ...clone(seed), ...result.state };
+  saveSession({ userId: result.userId, verifiedAt: new Date().toISOString() });
+  await autoJoinFromInvite();
+  render();
+  toast(result.email?.status === "sent" ? "Cadastro concluido. Email enviado." : "Cadastro concluido. Email de confirmacao registrado.");
+}
+
+async function registerEmail({ name, email, password }) {
+  const normalized = normalizeEmail(email);
+  if (!isValidEmail(normalized)) return toast("Informe um email valido.");
+  if (String(password || "").length < 6) return toast("A senha precisa ter pelo menos 6 caracteres.");
+  const result = await apiPost("api/auth/register", { name, email: normalized, password });
+  if (!result.ok) return toast(result.error || "Nao consegui cadastrar.");
+  state = { ...clone(seed), ...result.state };
+  saveSession({ userId: result.userId, verifiedAt: new Date().toISOString() });
+  await autoJoinFromInvite();
+  render();
+}
+
+async function forgotPassword(email) {
+  const normalized = normalizeEmail(email);
+  const result = await apiPost("api/auth/forgot", { email: normalized });
+  if (!result.ok) return toast(result.error || "Email nao encontrado.");
+  view.pendingEmail = normalized;
+  view.generatedCode = result.resetCode;
+  view.authMode = "reset";
+  render();
+  toast("Codigo local gerado para recuperacao.");
+}
+
+async function resetPassword({ code, password }) {
+  if (code !== view.generatedCode) return toast("Codigo invalido.");
+  if (String(password || "").length < 6) return toast("A senha precisa ter pelo menos 6 caracteres.");
+  const result = await apiPost("api/auth/reset", { email: view.pendingEmail, code, password });
+  if (!result.ok) return toast(result.error || "Nao consegui alterar a senha.");
+  state = { ...clone(seed), ...result.state };
+  view.authMode = "login";
+  view.generatedCode = "";
+  view.pendingEmail = "";
+  render();
+  toast("Senha alterada.");
+}
+
+async function updateProfile({ name }) {
+  const user = currentUser();
+  const nextName = String(name || "").trim();
+  if (!user || nextName.length < 2) return toast("Informe um nome valido.");
+  user.name = nextName;
+  await persistAndRender();
+  toast("Nome atualizado.");
+}
+
+async function createLeague({ name, expires }) {
+  const user = currentUser();
+  const league = {
+    id: uid("lig"),
+    name: name.trim(),
+    expiresAt: expires,
+    ownerId: user.id,
+    members: [user.id],
+    invitedEmails: [],
+    code: `NB${Math.floor(1000 + Math.random() * 9000)}`,
+  };
+  state.leagues.push(league);
+  view.selectedLeagueId = league.id;
+  view.tab = "liga";
+  view.leagueView = "mine";
+  view.modal = null;
+  await persistAndRender();
+}
+
+async function joinLeague(code) {
+  const user = currentUser();
+  const query = String(code || "").trim().toLowerCase();
+  const league = state.leagues.find((item) => item.code.toLowerCase() === query)
+    || state.leagues.find((item) => item.name.toLowerCase().includes(query));
+  if (!league) return toast("Liga nao encontrada no data.json.");
+  if (!league.members.includes(user.id)) league.members.push(user.id);
+  view.selectedLeagueId = league.id;
+  view.tab = "liga";
+  view.leagueView = "mine";
+  view.modal = null;
+  await persistAndRender();
+}
+
+async function leaveLeague(leagueId) {
+  const league = state.leagues.find((item) => item.id === leagueId);
+  if (!league || !session?.userId) return toast("Liga nao encontrada.");
+  if (!window.confirm(`Sair da liga "${league.name}"? Seus palpites nesta liga serao removidos.`)) return;
+
+  league.members = league.members.filter((memberId) => memberId !== session.userId);
+  state.picks = state.picks.filter((pick) => pick.leagueId !== league.id || pick.userId !== session.userId);
+
+  if (league.members.length === 0) {
+    state.leagues = state.leagues.filter((item) => item.id !== league.id);
+    state.picks = state.picks.filter((pick) => pick.leagueId !== league.id);
+  } else if (league.ownerId === session.userId) {
+    league.ownerId = league.members[0];
+  }
+
+  view.selectedLeagueId = userLeagues()[0]?.id || null;
+  view.tab = "ligas";
+  view.leagueView = "mine";
+  await persistAndRender();
+  toast("Voce saiu da liga.");
+}
+
+function shareLeague(leagueId) {
+  const league = state.leagues.find((item) => item.id === leagueId) || currentLeague();
+  if (!league) return toast("Liga nao encontrada.");
+  const link = `${window.location.origin || "http://168.75.77.200:4173"}?join=${encodeURIComponent(league.code)}`;
+  const message = `Você foi convidado para a liga "${league.name}" do aplicativao NecroBET. Venha se divertir ou profetizar! ${link}`;
+  window.location.href = `https://wa.me/?text=${encodeURIComponent(message)}`;
+}
+
+async function autoJoinFromInvite() {
+  if (!view.pendingJoinCode || !session || !currentUser()) return;
+  const code = view.pendingJoinCode;
+  const league = state.leagues.find((item) => item.code.toLowerCase() === code.trim().toLowerCase());
+  if (!league) return;
+  if (!league.members.includes(session.userId)) {
+    league.members.push(session.userId);
+    await saveState();
+  }
+  view.selectedLeagueId = league.id;
+  view.tab = "liga";
+  view.leagueView = "mine";
+  view.pendingJoinCode = "";
+  const cleanUrl = `${window.location.origin}${window.location.pathname}`;
+  window.history.replaceState({}, "", cleanUrl);
+}
+
+async function inviteEmail(email) {
+  const league = currentLeague();
+  const normalized = normalizeEmail(email);
+  if (!league || !isValidEmail(normalized)) return toast("Informe um email valido.");
+  const result = await apiPost("api/league/invite", { leagueId: league.id, email: normalized });
+  if (!result.ok) return toast(result.error || "Nao consegui adicionar o convite.");
+  state = { ...clone(seed), ...result.state };
+  render();
+}
+
+async function pickContacts() {
+  if (!("contacts" in navigator) || !("ContactsManager" in window)) {
+    toast("Seu navegador nao liberou acesso a contatos. Use o campo manual.");
+    return;
+  }
+  try {
+    const contacts = await navigator.contacts.select(["name", "email"], { multiple: true });
+    for (const contact of contacts) {
+      await inviteEmail(contact.email?.[0] || "");
+    }
+    toast(`${contacts.length} contato(s) adicionados.`);
+  } catch {
+    toast("Selecao de contatos cancelada.");
+  }
+}
+
+async function identifyPerson(personName) {
+  const name = personName.trim();
+  if (!name) return;
+  const registered = state.people.find((item) => item.name.toLowerCase() === name.toLowerCase());
+  if (registered && registered.type === "publica" && registered.source !== "avatar local") {
+    if (personStatus(registered) === "Falecido") return toast("Somente personalidades vivas podem ser adicionadas.");
+    await addPickForPerson(registered);
+    return;
+  }
+
+  view.pendingPickName = name;
+  view.publicFigureAnswer = "";
+  view.publicFigureDetails = "";
+  view.showPublicRefine = false;
+  view.candidateResults = [];
+  view.identifying = true;
+  view.modal = { type: "identify" };
+  render();
+
+  const result = await searchPeople(name, "");
+  view.candidateResults = result.candidates || [];
+  view.identifying = false;
+  render();
+}
+
+async function refinePublicPerson({ personScope, category }) {
+  if (personScope === "private") {
+    await addPrivatePick(view.pendingPickName);
+    return;
+  }
+  const context = String(category || "").trim();
+  if (!context) return toast("Selecione o que a figura publica e.");
+  view.publicFigureAnswer = "yes";
+  view.publicFigureDetails = context;
+  view.showPublicRefine = false;
+  view.candidateResults = [];
+  view.identifying = true;
+  render();
+  const result = await searchPeople(view.pendingPickName, context);
+  view.candidateResults = result.candidates || [];
+  view.identifying = false;
+  render();
+}
+
+async function addPickFromCandidate(candidateId) {
+  const candidate = view.candidateResults.find((item) => item.id === candidateId);
+  if (!candidate) return toast("Candidato nao encontrado.");
+  if (candidate.status === "Falecido") return toast("Somente personalidades vivas podem ser adicionadas.");
+  let registered = state.people.find((item) => item.name.toLowerCase() === candidate.name.toLowerCase());
+  if (!registered) {
+    registered = {
+      name: candidate.name,
+      type: "publica",
+      image: candidate.image || initialsImage(candidate.name),
+      source: candidate.source || "Wikipedia",
+      classification: candidate.classification || "Pessoa publica",
+      status: candidate.status || "Vivo",
+      description: candidate.description || "",
+      url: candidate.url || "",
+    };
+    state.people.push(registered);
+  } else {
+    registered.status = candidate.status || personStatus(registered);
+    registered.classification = candidate.classification || registered.classification;
+    registered.description = candidate.description || registered.description;
+    registered.url = candidate.url || registered.url;
+  }
+  await addPickForPerson(registered);
+}
+
+async function addPrivatePick(personName) {
+  const league = currentLeague();
+  const name = personName.trim();
+  if (!league || !name) return;
+
+  let registered = state.people.find((item) => item.name.toLowerCase() === name.toLowerCase());
+  if (!registered) {
+    registered = {
+      name,
+      type: "privada",
+      image: initialsImage(name),
+      source: "avatar local",
+      classification: "Contato privado",
+      status: "Vivo",
+    };
+    state.people.push(registered);
+  }
+  await addPickForPerson(registered);
+}
+
+async function addPickForPerson(registered) {
+  const league = currentLeague();
+  if (!league || !registered) return;
+  if (personStatus(registered) === "Falecido") return toast("Somente personalidades vivas podem ser adicionadas.");
+
+  state.picks.push({
+    id: uid("bet"),
+    leagueId: league.id,
+    userId: session.userId,
+    personName: registered.name,
+    createdAt: new Date().toISOString(),
+  });
+  view.modal = null;
+  await persistAndRender();
+}
+
+async function deletePick(pickId) {
+  const pick = state.picks.find((item) => item.id === pickId);
+  if (!pick) return toast("Palpite nao encontrado.");
+  if (pick.userId !== session?.userId) return toast("Voce so pode excluir seus proprios palpites.");
+
+  state.picks = state.picks.filter((item) => item.id !== pickId);
+  await persistAndRender();
+  toast("Palpite excluido.");
+}
+
+async function searchPeople(name, context = "") {
+  try {
+    const params = new URLSearchParams({ name, context });
+    const response = await fetch(`api/people-search?${params.toString()}`, { cache: "no-store" });
+    if (!response.ok) return { candidates: [] };
+    return await response.json();
+  } catch {
+    return { candidates: [] };
+  }
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function userEmailLabel(user) {
+  return user?.emailMasked || user?.email || user?.phone || "";
+}
+
+function maskEmail(email) {
+  const [local, domain] = normalizeEmail(email).split("@");
+  if (!local || !domain) return "";
+  const visible = local.length <= 2 ? local[0] : `${local.slice(0, 2)}${"*".repeat(Math.min(local.length - 2, 6))}`;
+  return `${visible}@${domain}`;
+}
+
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(String(value || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+async function makePasswordRecord(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  return {
+    passwordAlgo: "PBKDF2-SHA256",
+    passwordIterations: 150000,
+    passwordSalt: bytesToBase64(salt),
+    passwordHash: await pbkdf2Hash(password, salt, 150000),
+  };
+}
+
+async function verifyPassword(user, password) {
+  if (user.passwordAlgo === "PBKDF2-SHA256" && user.passwordSalt && user.passwordHash) {
+    const salt = base64ToBytes(user.passwordSalt);
+    const candidate = await pbkdf2Hash(password, salt, user.passwordIterations || 150000);
+    return candidate === user.passwordHash;
+  }
+
+  return user.passwordHash === legacyPasswordHash(password);
+}
+
+async function pbkdf2Hash(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(String(password || "")),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+    key,
+    256
+  );
+  return bytesToBase64(new Uint8Array(bits));
+}
+
+function legacyPasswordHash(password) {
+  let hash = 2166136261;
+  const value = String(password || "");
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `local-${(hash >>> 0).toString(16)}`;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+function formatDate(value) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
+}
+
+function initialsImage(name) {
+  const initials = escapeHtml(
+    name
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase() || "")
+      .join("")
+  );
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+      <rect width="160" height="160" rx="18" fill="#211629"/>
+      <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle" fill="#e9d5ff" font-family="Arial, sans-serif" font-size="48" font-weight="800">${initials}</text>
+    </svg>`;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function toast(message) {
+  const old = document.querySelector(".toast");
+  if (old) old.remove();
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = message;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2800);
+}
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("service-worker.js").catch(() => {});
+  });
+}
+
+loadState();
+
+{
+  "users": [],
+  "leagues": [],
+  "people": [
+    {
+      "name": "Pessoa Publica Demo",
+      "type": "publica",
+      "image": "NecroBET-logo.png",
+      "source": "demo",
+      "status": "Vivo"
+    }
+  ],
+  "picks": []
+}
+
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="description" content="NecroBET — Bolao privado de palpites entre amigos. Crie ligas, faca palpites e acompanhe o ranking em tempo real.">
+  <meta name="theme-color" content="#120616">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="NecroBET">
+  <link rel="icon" type="image/png" href="NecroBET-logo_v3.png">
+  <link rel="apple-touch-icon" href="NecroBET-logo_v3.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <title>NecroBET — Bolao de Palpites</title>
+</head>
+<body>
+  <div id="app" class="app-shell"></div>
+  <script src="app.js"></script>
+</body>
+</html>
+
+{
+  "name": "NecroBET",
+  "short_name": "NecroBET",
+  "description": "Bolao privado de palpites em formato PWA.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08070a",
+  "theme_color": "#120616",
+  "icons": [
+    {
+      "src": "NecroBET-logo_v3.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
+
+NECROBET_APP_URL=http://127.0.0.1:4173
+NECROBET_SMTP_HOST=
+NECROBET_SMTP_PORT=587
+NECROBET_SMTP_USER=
+NECROBET_SMTP_PASSWORD=
+NECROBET_EMAIL_FROM=
+NECROBET_SMTP_TLS=starttls
+
+# NecroBET
+
+PWA mobile-first para validar localmente a experiencia do produto antes de plugar backend e deploy em OCI.
+Nesta versao, os dados compartilhados ficam em `data.json`, gravados pelo servidor local `serve.ps1`.
+O arquivo `data.json` local nao deve ser versionado porque pode conter usuarios, hashes e ligas reais; use `data.example.json` como referencia limpa.
+
+## Rodar localmente
+
+```powershell
+cd C:\Users\tbeni\OneDrive\Documentos\Git\Pessoal\NecroBET
+powershell -ExecutionPolicy Bypass -File .\serve.ps1
+```
+
+Depois acesse:
+
+```text
+http://127.0.0.1:4173
+```
+
+## Email de cadastro
+
+Ao concluir um cadastro, o backend tenta enviar um email de confirmacao. Configure SMTP por variaveis de ambiente:
+
+```text
+NECROBET_APP_URL=http://147.15.97.110:4173
+NECROBET_SMTP_HOST=smtp.seu-provedor.com
+NECROBET_SMTP_PORT=587
+NECROBET_SMTP_USER=usuario-smtp
+NECROBET_SMTP_PASSWORD=senha-smtp
+NECROBET_EMAIL_FROM=NecroBET <no-reply@seudominio.com>
+NECROBET_SMTP_TLS=starttls
+```
+
+Valores aceitos para `NECROBET_SMTP_TLS`: `starttls`, `ssl` ou `none`.
+Sem SMTP configurado, o cadastro continua funcionando e a mensagem fica registrada em `email-outbox.json` para validacao local.
+
+## Fluxos da versao inicial
+
+- Login por email e senha.
+- Email de confirmacao enviado ao concluir cadastro, quando SMTP estiver configurado.
+- Recuperacao local de senha pelo fluxo "Esqueci minha senha".
+- Novos usuarios armazenam `emailHash`, `emailMasked` e senha com PBKDF2-SHA256 + salt no `data.json`.
+- Criacao e acesso a ligas por codigo.
+- Convite por email e tentativa de uso da Contact Picker API quando o navegador permitir.
+- Navegacao dentro de cada liga para registrar palpites especificos daquela liga.
+- Palpites por liga com autocomplete de pessoas ja cadastradas no `data.json`.
+- Identificacao de pessoa publica via candidatos da Wikipedia antes de salvar o palpite.
+- Classificacao automatica inicial: Musica, Politica, Cinema/TV, Esporte, Negocios, Midia/Literatura, Ciencia ou Pessoa publica.
+- Busca automatica de foto publica apos o usuario confirmar o candidato correto.
+- PWA instalavel no iOS/Android pelo navegador.
+
+## Proximos passos para backend
+
+- Trocar a recuperacao local por envio real de email com codigo ou link seguro.
+- Salvar senhas com hash forte no backend e mover a recuperacao para token/link de uso unico.
+- Criar API de usuarios, ligas, convites, pessoas e palpites.
+- Baixar e salvar imagens publicas em object storage, em vez de guardar apenas a URL da origem.
+- Compartilhar codigos/links de liga entre dispositivos.
+- Adicionar regras de privacidade, moderacao e consentimento para contatos privados.
+- Opcional: adicionar um LLM gratuito/baixo custo como camada posterior para transformar apelidos e contexto em consultas melhores.
+
+// ===== HEADER SCROLL =====
+const header = document.getElementById('header');
+window.addEventListener('scroll', () => {
+  if (window.scrollY > 60) {
+    header.classList.add('scrolled');
+  } else {
+    header.classList.remove('scrolled');
+  }
+});
+
+// ===== MENU MOBILE =====
+const menuToggle = document.getElementById('menuToggle');
+const nav = document.getElementById('nav');
+
+menuToggle.addEventListener('click', () => {
+  nav.classList.toggle('active');
+});
+
+// Fecha menu ao clicar em um link
+nav.querySelectorAll('a').forEach(link => {
+  link.addEventListener('click', () => {
+    nav.classList.remove('active');
+  });
+});
+
+// ===== NAVEGACAO ATIVA =====
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('#nav a[href^="#"]');
+
+window.addEventListener('scroll', () => {
+  let current = '';
+  sections.forEach(section => {
+    const sectionTop = section.offsetTop - 120;
+    if (window.scrollY >= sectionTop) {
+      current = section.getAttribute('id');
+    }
+  });
+
+  navLinks.forEach(link => {
+    link.style.color = '';
+    link.style.background = '';
+    if (link.getAttribute('href') === '#' + current) {
+      link.style.color = '#c9a84c';
+    }
+  });
+});
+
+// ===== FORMULARIO =====
+function enviarFormulario(e) {
+  e.preventDefault();
+  const btn = document.getElementById('btnEnviar');
+  const msg = document.getElementById('formMsg');
+
+  btn.textContent = 'Enviando...';
+  btn.disabled = true;
+
+  setTimeout(() => {
+    btn.textContent = 'Enviar Mensagem';
+    btn.disabled = false;
+    msg.style.display = 'block';
+    document.getElementById('formContato').reset();
+
+    setTimeout(() => {
+      msg.style.display = 'none';
+    }, 5000);
+  }, 1500);
+}
+
+// ===== ANIMACOES DE ENTRADA (Intersection Observer) =====
+const animateOnScroll = (selector, animClass) => {
+  const elements = document.querySelectorAll(selector);
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add(animClass);
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.15 });
+
+  elements.forEach(el => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(28px)';
+    el.style.transition = 'opacity 0.55s ease, transform 0.55s ease';
+    observer.observe(el);
+  });
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  // Anima cards e cards de grid
+  const toAnimate = document.querySelectorAll(
+    '.tec-card, .al-card, .ad-card, .dep-card, .un-card, .qf-item, .empresa-text, .empresa-img-wrap, .quimio-text, .quimio-img-wrap, .contato-text, .contato-form'
+  );
+
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach((entry, index) => {
+      if (entry.isIntersecting) {
+        setTimeout(() => {
+          entry.target.style.opacity = '1';
+          entry.target.style.transform = 'translateY(0)';
+        }, 80 * (index % 6));
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.12 });
+
+  toAnimate.forEach(el => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(28px)';
+    el.style.transition = 'opacity 0.55s ease, transform 0.55s ease';
+    observer.observe(el);
+  });
+});
+
+// ===== SMOOTH SCROLL PARA LINKS INTERNOS =====
+document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+  anchor.addEventListener('click', function(e) {
+    const target = document.querySelector(this.getAttribute('href'));
+    if (target) {
+      e.preventDefault();
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  });
+});
+
+// ===== CONTADOR ANIMADO NO HERO =====
+const animateCounter = (el, target, duration = 1500) => {
+  let start = 0;
+  const step = target / (duration / 16);
+  const interval = setInterval(() => {
+    start += step;
+    if (start >= target) {
+      el.textContent = el.dataset.suffix
+        ? target + el.dataset.suffix
+        : '+' + target.toLocaleString('pt-BR');
+      clearInterval(interval);
+    } else {
+      el.textContent = el.dataset.suffix
+        ? Math.floor(start) + el.dataset.suffix
+        : '+' + Math.floor(start).toLocaleString('pt-BR');
+    }
+  }, 16);
+};
+
+const heroObserver = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const nums = document.querySelectorAll('.hero-card-num');
+      nums[0] && animateCounter(nums[0], 5000);
+      heroObserver.disconnect();
+    }
+  });
+}, { threshold: 0.5 });
+
+const heroSection = document.querySelector('.hero');
+if (heroSection) heroObserver.observe(heroSection);
+
+#Requires -Version 5.1
+$ErrorActionPreference = "Stop"
+
+# Define the root path
+$RootPath = $PSScriptRoot
+Set-Location -Path $RootPath
+
+# Function to check if Python is installed
+function Check-Python {
+    try {
+        $pythonVersion = python --version 2>&1
+        Write-Host "Python found: $pythonVersion" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "Python is not installed or not in the PATH." -ForegroundColor Red
+        Write-Host "Please install Python 3.7 or newer from https://www.python.org/downloads/" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+# Check for Python
+if (-not (Check-Python)) {
+    Write-Host "Exiting because Python is required to run the server." -ForegroundColor Red
+    exit 1
+}
+
+# Run the server script
+Write-Host "Starting NecroBET server..." -ForegroundColor Cyan
+Write-Host "The application will be available at http://127.0.0.1:4173" -ForegroundColor Cyan
+Write-Host "Press Ctrl+C to stop the server." -ForegroundColor Yellow
+
+try {
+    python server.py
+} catch {
+    Write-Host "Error running the server: $_" -ForegroundColor Red
+}
+
+#!/usr/bin/env python3
+import argparse
+import base64
+from email.message import EmailMessage
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import smtplib
+import ssl
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DATA_FILE = ROOT / "data.json"
+EMAIL_OUTBOX_FILE = ROOT / "email-outbox.json"
+USER_AGENT = "NecroBET/0.1 local prototype"
+STATIC_FILES = {
+    "index.html",
+    "app.js",
+    "styles.css",
+    "service-worker.js",
+    "manifest.webmanifest",
+    "NecroBET-logo.png",
+    "NecroBET-logo_v2.png",
+    "NecroBET-logo_v3.png",
+    "WhatsApp_icon.png",
+    "Logo-bet.png",
+    "Logo-bet_v2.png",
+}
+
+SEED = {
+    "users": [],
+    "leagues": [],
+    "people": [
+        {
+            "name": "Pessoa Publica Demo",
+            "type": "publica",
+            "image": "NecroBET-logo_v3.png",
+            "source": "demo",
+            "classification": "Pessoa publica",
+            "status": "Vivo",
+        }
+    ],
+    "picks": [],
+}
+
+RESET_CODES = {}
+
+
+def app_url():
+    return os.environ.get("NECROBET_APP_URL", "http://147.15.97.110:4173").rstrip("/")
+
+
+def smtp_config():
+    return {
+        "host": os.environ.get("NECROBET_SMTP_HOST", "").strip(),
+        "port": int(os.environ.get("NECROBET_SMTP_PORT", "587") or 587),
+        "user": os.environ.get("NECROBET_SMTP_USER", "").strip(),
+        "password": os.environ.get("NECROBET_SMTP_PASSWORD", ""),
+        "from": os.environ.get("NECROBET_EMAIL_FROM", "").strip(),
+        "tls": os.environ.get("NECROBET_SMTP_TLS", "starttls").strip().lower(),
+    }
+
+
+def read_email_outbox():
+    if not EMAIL_OUTBOX_FILE.exists():
+        return []
+    try:
+        return json.loads(EMAIL_OUTBOX_FILE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+
+
+def write_email_outbox(items):
+    EMAIL_OUTBOX_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def queue_email(to_email, subject, text):
+    import datetime
+
+    items = read_email_outbox()
+    items.append(
+        {
+            "to": mask_email(to_email),
+            "subject": subject,
+            "text": text,
+            "queuedAt": datetime.datetime.utcnow().isoformat() + "Z",
+            "reason": "SMTP nao configurado ou falhou",
+        }
+    )
+    write_email_outbox(items[-100:])
+
+
+def send_email(to_email, subject, text):
+    config = smtp_config()
+    sender = config["from"] or config["user"]
+    if not config["host"] or not sender:
+        queue_email(to_email, subject, text)
+        return {"status": "queued", "message": "Email registrado na caixa local de saida."}
+
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(text)
+
+    try:
+        if config["tls"] == "ssl":
+            with smtplib.SMTP_SSL(config["host"], config["port"], timeout=12, context=ssl.create_default_context()) as smtp:
+                if config["user"]:
+                    smtp.login(config["user"], config["password"])
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(config["host"], config["port"], timeout=12) as smtp:
+                if config["tls"] != "none":
+                    smtp.starttls(context=ssl.create_default_context())
+                if config["user"]:
+                    smtp.login(config["user"], config["password"])
+                smtp.send_message(message)
+        return {"status": "sent", "message": "Email enviado."}
+    except Exception as exc:
+        queue_email(to_email, subject, text)
+        print(f"Email delivery failed for {mask_email(to_email)}: {exc}", flush=True)
+        return {"status": "queued", "message": "Email registrado na caixa local de saida."}
+
+
+def send_registration_email(email, name):
+    subject = "Cadastro concluido no NecroBET"
+    text = (
+        f"Ola, {name}!\n\n"
+        "Seu cadastro no NecroBET foi concluido com sucesso.\n\n"
+        f"Acesse o aplicativo em: {app_url()}\n\n"
+        "Se voce nao realizou este cadastro, ignore esta mensagem.\n\n"
+        "Grupo BQTech"
+    )
+    return send_email(email, subject, text)
+
+
+def ensure_data_file():
+    if not DATA_FILE.exists():
+        DATA_FILE.write_text(json.dumps(SEED, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_state():
+    ensure_data_file()
+    return json.loads(DATA_FILE.read_text(encoding="utf-8-sig"))
+
+
+def write_state(state):
+    DATA_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def normalize_email(email):
+    return (email or "").strip().lower()
+
+
+def email_hash(email):
+    return hashlib.sha256(normalize_email(email).encode("utf-8")).hexdigest()
+
+
+def mask_email(email):
+    local, _, domain = normalize_email(email).partition("@")
+    if not local or not domain:
+        return ""
+    visible = local[0] if len(local) <= 2 else f"{local[:2]}{'*' * min(len(local) - 2, 6)}"
+    return f"{visible}@{domain}"
+
+
+def is_valid_email(email):
+    return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", normalize_email(email)))
+
+
+def make_password_record(password):
+    salt = os.urandom(16)
+    iterations = 150000
+    digest = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, iterations, dklen=32)
+    return {
+        "passwordAlgo": "PBKDF2-SHA256",
+        "passwordIterations": iterations,
+        "passwordSalt": base64.b64encode(salt).decode("ascii"),
+        "passwordHash": base64.b64encode(digest).decode("ascii"),
+    }
+
+
+def legacy_password_hash(password):
+    value = password or ""
+    hash_value = 2166136261
+    for char in value:
+        hash_value ^= ord(char)
+        hash_value = (hash_value * 16777619) & 0xFFFFFFFF
+    return f"local-{hash_value:08x}"
+
+
+def verify_password(user, password):
+    if user.get("passwordAlgo") == "PBKDF2-SHA256" and user.get("passwordSalt") and user.get("passwordHash"):
+        salt = base64.b64decode(user["passwordSalt"])
+        iterations = int(user.get("passwordIterations") or 150000)
+        digest = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, iterations, dklen=32)
+        return hmac.compare_digest(base64.b64encode(digest).decode("ascii"), user["passwordHash"])
+    return user.get("passwordHash") == legacy_password_hash(password)
+
+
+def find_user_by_email(state, email):
+    normalized = normalize_email(email)
+    hashed = email_hash(normalized)
+    for user in state.get("users", []):
+        if user.get("emailHash") == hashed or normalize_email(user.get("email")) == normalized:
+            return user
+    return None
+
+
+def migrate_user_email(user, email):
+    normalized = normalize_email(email)
+    user["emailHash"] = email_hash(normalized)
+    user["emailMasked"] = mask_email(normalized)
+    user.pop("email", None)
+
+
+def fetch_json(url):
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def life_status(summary):
+    text = f"{summary.get('description') or ''} {summary.get('extract') or ''}".lower()
+    if re.search(r"\b(falecido|falecida|morto|morta|morreu|falecimento|died|deceased|dead|death)\b", text):
+        return "Falecido"
+
+    wikibase_item = summary.get("wikibase_item") or ""
+    if wikibase_item:
+        try:
+            data = fetch_json(f"https://www.wikidata.org/wiki/Special:EntityData/{urllib.parse.quote(wikibase_item)}.json")
+            entity = data.get("entities", {}).get(wikibase_item, {})
+            claims = entity.get("claims", {})
+            if claims.get("P570"):
+                return "Falecido"
+        except Exception:
+            pass
+
+    return "Vivo"
+
+
+def person_class(text):
+    value = (text or "").lower()
+    if re.search(r"cantor|cantora|singer|vocalist|musician|músico|musico|música|musica|composer|compositor|rapper|funk", value):
+        return "Musica"
+    if re.search(r"político|politico|política|politica|president|presidente|senator|senador|deputado|governador|minister|prime minister", value):
+        return "Politica"
+    if re.search(r"actor|actress|atriz|ator|apresentador|apresentadora|filmmaker|director|diretor|television|televisão|cinema|comedian|comediante", value):
+        return "Cinema/TV"
+    if re.search(r"footballer|soccer|jogador|atleta|tennis|boxer|piloto|racing|sport|olympic", value):
+        return "Esporte"
+    if re.search(r"business|empresario|empresário|executive|ceo|founder|fundador|bilionario|investor", value):
+        return "Negocios"
+    if re.search(r"writer|author|escritor|journalist|jornalista|poet|poeta", value):
+        return "Midia/Literatura"
+    if re.search(r"scientist|cientista|physicist|mathematician|researcher|professor|inventor", value):
+        return "Ciencia"
+    return "Pessoa publica"
+
+
+def base_name(name):
+    cleaned = re.sub(
+        r"\b(cantor|cantora|artista|ator|atriz|apresentador|apresentadora|politico|político|politica|política|presidente|president|atleta|empresario|empresário|brasileiro|brasileira)\b",
+        "",
+        name or "",
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or name
+
+
+def normalize_candidate(summary, lang, context):
+    image = ""
+    if isinstance(summary.get("thumbnail"), dict):
+        image = summary["thumbnail"].get("source") or ""
+    if not image and isinstance(summary.get("originalimage"), dict):
+        image = summary["originalimage"].get("source") or ""
+
+    description = summary.get("description") or summary.get("extract") or ""
+    urls = summary.get("content_urls") or {}
+    desktop = urls.get("desktop") or {}
+    classification = person_class(f"{description} {summary.get('extract') or ''} {context}")
+    status = life_status(summary)
+    return {
+        "id": f"wiki-{lang}-{summary.get('pageid')}",
+        "name": summary.get("title") or "",
+        "image": image,
+        "description": description,
+        "classification": classification,
+        "status": status,
+        "source": f"Wikipedia {lang}",
+        "url": desktop.get("page") or "",
+    }
+
+
+def weak_candidate(candidate):
+    text = f"{candidate.get('name', '')} {candidate.get('description', '')}".lower()
+    title = candidate.get("name", "").lower()
+    weak = (
+        "desambiguação",
+        "desambiguacao",
+        "disambiguation",
+        "wikimedia",
+        "topics referred",
+        "same term",
+        "programa",
+        "television program",
+        "campanha presidencial",
+        "presidential campaign",
+        "elections",
+        "eleições",
+        "album",
+        "álbum",
+        "canção",
+        "song",
+        "língua",
+        "lingua",
+        "language",
+        "demographic",
+        "demografia",
+        "ethnic group",
+    )
+    title_only_weak = ("programa", "television program", "album", "Ã¡lbum", "canÃ§Ã£o", "song")
+    if any(item in title for item in title_only_weak):
+        return True
+    text_weak = tuple(item for item in weak if item not in title_only_weak)
+    if any(item in text for item in text_weak):
+        return True
+    return bool(re.search(r"lista de|list of|discografia|filmografia", title))
+
+
+def candidate_score(candidate, name, context):
+    score = 0
+    haystack = f"{candidate.get('name', '')} {candidate.get('description', '')} {candidate.get('classification', '')}".lower()
+    if base_name(name).lower() in candidate.get("name", "").lower():
+        score += 20
+    if candidate.get("image"):
+        score += 5
+    for word in re.sub(r"[^\w\s]", " ", context or "").lower().split():
+        if len(word) >= 4 and word in haystack:
+            score += 4
+    return score
+
+
+def search_people(name, context=""):
+    languages = ["pt", "en"]
+    query_hints = [
+        "",
+        " funk",
+        " funk brasileiro",
+        " anos 90",
+        " anos 2000",
+        " presidente",
+        " president",
+        " politico",
+        " política",
+        " cantor",
+        " cantor brasileiro",
+        " cantora",
+        " artista",
+        " ator",
+        " atriz",
+        " apresentador",
+        " apresentador brasileiro",
+        " apresentadora",
+        " atleta",
+        " empresario",
+        " brasileira",
+        " brasileiro",
+    ]
+    title_hints = ["", " (cantor)", " (cantora)", " (músico)", " (musico)", " (ator)", " (atriz)", " (apresentador)", " (político)", " (politico)", " (atleta)", " (empresário)", " (singer)", " (actor)", " (politician)"]
+    root_name = base_name(name)
+    queries = [name]
+    if context:
+        queries.extend([f"{name} {context}", f"{root_name} {context}"])
+
+    seen = set()
+    items = []
+
+    for lang in languages:
+        for hint in title_hints:
+            if len(items) >= 8:
+                break
+            try:
+                title = urllib.parse.quote(f"{root_name}{hint}")
+                summary = fetch_json(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}")
+                candidate = normalize_candidate(summary, lang, context)
+                key = candidate["name"].lower()
+                if key and key not in seen and (candidate["image"] or candidate["description"]) and not weak_candidate(candidate):
+                    items.append(candidate)
+                    seen.add(key)
+            except Exception:
+                pass
+
+        for query in queries:
+            for hint in query_hints:
+                if len(items) >= 8:
+                    break
+                try:
+                    search = urllib.parse.quote(f"{query}{hint}")
+                    data = fetch_json(f"https://{lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch={search}&srlimit=5&format=json&origin=*")
+                    for result in data.get("query", {}).get("search", []):
+                        if len(items) >= 8:
+                            break
+                        title = result.get("title") or ""
+                        key = title.lower()
+                        if not title or key in seen:
+                            continue
+                        try:
+                            summary = fetch_json(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}")
+                            candidate = normalize_candidate(summary, lang, context)
+                            if (candidate["image"] or candidate["description"]) and not weak_candidate(candidate):
+                                items.append(candidate)
+                                seen.add(key)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+    items.sort(key=lambda item: candidate_score(item, name, context), reverse=True)
+    return {"query": name, "context": context, "candidates": items}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send_bytes(self, status, body, content_type):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store" if self.path.startswith("/api/") else "public, max-age=60")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, status, payload):
+        self.send_bytes(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+    def do_GET(self):
+        ensure_data_file()
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/state":
+            self.send_bytes(200, DATA_FILE.read_bytes(), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/api/people-search":
+            query = urllib.parse.parse_qs(parsed.query)
+            name = (query.get("name") or [""])[0].strip()
+            context = (query.get("context") or [""])[0].strip()
+            self.send_json(200, search_people(name, context) if name else {"query": "", "candidates": []})
+            return
+        if parsed.path == "/api/photo":
+            query = urllib.parse.parse_qs(parsed.query)
+            name = (query.get("name") or [""])[0].strip()
+            results = search_people(name)
+            candidate = (results["candidates"] or [{}])[0]
+            self.send_json(200, {"image": candidate.get("image", ""), "source": candidate.get("source", ""), "title": candidate.get("name", "")})
+            return
+
+        relative = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
+        if relative not in STATIC_FILES:
+            self.send_bytes(404, b"Not found", "text/plain; charset=utf-8")
+            return
+        target = (ROOT / relative).resolve()
+        if not str(target).startswith(str(ROOT)) or not target.is_file():
+            self.send_bytes(404, b"Not found", "text/plain; charset=utf-8")
+            return
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        self.send_bytes(200, target.read_bytes(), content_type)
+
+    def do_PUT(self):
+        self.handle_state_write()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/auth/") or parsed.path == "/api/league/invite":
+            self.handle_api_post(parsed.path)
+            return
+        self.handle_state_write()
+
+    def read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def handle_api_post(self, path):
+        try:
+            payload = self.read_json_body()
+        except Exception:
+            self.send_json(400, {"ok": False, "error": "Invalid JSON"})
+            return
+
+        state = read_state()
+
+        if path == "/api/auth/login":
+            email = normalize_email(payload.get("email"))
+            password = payload.get("password") or ""
+            user = find_user_by_email(state, email)
+            if not user or not verify_password(user, password):
+                self.send_json(401, {"ok": False, "error": "Email ou senha invalidos."})
+                return
+            migrate_user_email(user, email)
+            write_state(state)
+            self.send_json(200, {"ok": True, "userId": user["id"], "state": state})
+            return
+
+        if path == "/api/auth/register":
+            name = (payload.get("name") or "").strip()
+            email = normalize_email(payload.get("email"))
+            password = payload.get("password") or ""
+            if not name or not is_valid_email(email) or len(password) < 6:
+                self.send_json(400, {"ok": False, "error": "Dados de cadastro invalidos."})
+                return
+            existing = find_user_by_email(state, email)
+            if existing and existing.get("passwordHash"):
+                self.send_json(409, {"ok": False, "error": "Este email ja esta cadastrado."})
+                return
+            user = existing or {
+                "id": f"usr_{secrets.token_hex(8)}",
+                "createdAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            }
+            user["emailHash"] = email_hash(email)
+            user["emailMasked"] = mask_email(email)
+            user["name"] = name
+            user.update(make_password_record(password))
+            if not existing:
+                state.setdefault("users", []).append(user)
+            write_state(state)
+            email_result = send_registration_email(email, name)
+            self.send_json(200, {"ok": True, "userId": user["id"], "state": state, "email": email_result})
+            return
+
+        if path == "/api/auth/forgot":
+            email = normalize_email(payload.get("email"))
+            user = find_user_by_email(state, email)
+            if not user:
+                self.send_json(404, {"ok": False, "error": "Email nao encontrado."})
+                return
+            code = str(secrets.randbelow(900000) + 100000)
+            RESET_CODES[email_hash(email)] = code
+            self.send_json(200, {"ok": True, "resetCode": code})
+            return
+
+        if path == "/api/auth/reset":
+            email = normalize_email(payload.get("email"))
+            code = str(payload.get("code") or "")
+            password = payload.get("password") or ""
+            key = email_hash(email)
+            user = find_user_by_email(state, email)
+            if not user or RESET_CODES.get(key) != code or len(password) < 6:
+                self.send_json(400, {"ok": False, "error": "Codigo ou senha invalidos."})
+                return
+            user.update(make_password_record(password))
+            migrate_user_email(user, email)
+            user["passwordResetAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+            RESET_CODES.pop(key, None)
+            write_state(state)
+            self.send_json(200, {"ok": True, "state": state})
+            return
+
+        if path == "/api/league/invite":
+            league_id = payload.get("leagueId")
+            email = normalize_email(payload.get("email"))
+            if not league_id or not is_valid_email(email):
+                self.send_json(400, {"ok": False, "error": "Convite invalido."})
+                return
+            league = next((item for item in state.get("leagues", []) if item.get("id") == league_id), None)
+            if not league:
+                self.send_json(404, {"ok": False, "error": "Liga nao encontrada."})
+                return
+            user = find_user_by_email(state, email)
+            if not user:
+                user = {
+                    "id": f"usr_{secrets.token_hex(8)}",
+                    "emailHash": email_hash(email),
+                    "emailMasked": mask_email(email),
+                    "name": mask_email(email),
+                    "invitedAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                }
+                state.setdefault("users", []).append(user)
+            league.setdefault("members", [])
+            if user["id"] not in league["members"]:
+                league["members"].append(user["id"])
+            league.setdefault("invitedEmails", [])
+            if mask_email(email) not in league["invitedEmails"]:
+                league["invitedEmails"].append(mask_email(email))
+            write_state(state)
+            self.send_json(200, {"ok": True, "state": state})
+            return
+
+        self.send_json(404, {"ok": False, "error": "Not found"})
+
+    def handle_state_write(self):
+        if urllib.parse.urlparse(self.path).path != "/api/state":
+            self.send_bytes(404, b"Not found", "text/plain; charset=utf-8")
+            return
+        try:
+            payload = self.read_json_body()
+            write_state(payload)
+            self.send_json(200, {"ok": True})
+        except Exception:
+            self.send_bytes(400, b"Invalid JSON", "text/plain; charset=utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=4173, type=int)
+    args = parser.parse_args()
+    ensure_data_file()
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"NecroBET running on http://{args.host}:{args.port}")
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+
+const CACHE_NAME = "necrobet-cache-v23";
+const ASSETS = [
+  "./",
+  "./index.html",
+  "./styles.css",
+  "./app.js",
+  "./manifest.webmanifest",
+  "./NecroBET-logo.png",
+  "./NecroBET-logo_v2.png",
+  "./NecroBET-logo_v3.png",
+  "./WhatsApp_icon.png",
+  "./Logo-bet.png",
+  "./Logo-bet_v2.png",
+];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)));
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+  );
+  self.clients.claim();
+});
+
+self.addEventListener("fetch", (event) => {
+  if (event.request.method !== "GET") return;
+  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
+});
+
+:root {
+  color-scheme: dark;
+  --bg: #000000;
+  --panel: #0b090d;
+  --panel-2: #1b1323;
+  --line: #30223c;
+  --text: #f7f2fb;
+  --muted: #afa2ba;
+  --purple: #8b2cf5;
+  --purple-2: #b96cff;
+  --green: #34d399;
+  --red: #fb7185;
+  --amber: #fbbf24;
+  --shadow: 0 18px 55px rgba(0, 0, 0, 0.45);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, #000000 0%, #050306 42%, #0b0610 100%),
+    radial-gradient(circle at 50% 100%, rgba(139, 44, 245, 0.16), transparent 22rem),
+    var(--bg);
+  color: var(--text);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.app-shell {
+  width: min(100%, 440px);
+  min-height: 100vh;
+  margin: 0 auto;
+  background: #000000;
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.screen {
+  min-height: 100vh;
+  padding: max(18px, env(safe-area-inset-top)) 16px max(88px, env(safe-area-inset-bottom));
+}
+
+.auth-screen {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
+  background:
+    linear-gradient(180deg, #000000 0%, #000000 44%, #07040a 100%),
+    var(--bg);
+}
+
+.auth-brand {
+  display: grid;
+  place-items: center;
+  padding: 0 12px 8px;
+}
+
+.auth-brand img {
+  width: min(82vw, 320px);
+  max-height: 220px;
+  object-fit: contain;
+}
+
+.login-footer {
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand img {
+  width: 64px;
+  height: 64px;
+  object-fit: contain;
+  border-radius: 14px;
+  background: #050406;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 34px;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.brand span,
+.eyebrow,
+.small,
+.muted {
+  color: var(--muted);
+}
+
+.panel,
+.bet-card,
+.league-card,
+.candidate-card,
+.person-card,
+.member-card,
+.grouped-pick-card,
+.ranking-card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.025));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+}
+
+.panel {
+  padding: 16px;
+}
+
+.stack {
+  display: grid;
+  gap: 12px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.between {
+  justify-content: space-between;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  margin: -18px -16px 12px;
+  padding: max(14px, env(safe-area-inset-top)) 16px 12px;
+  background: rgba(8, 7, 10, 0.92);
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.topbar .brand img {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+}
+
+.topbar h1 {
+  font-size: 18px;
+}
+
+.icon-button,
+.ghost-button,
+.primary-button,
+.danger-button {
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text);
+  background: transparent;
+}
+
+.icon-button {
+  width: 44px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.primary-button,
+.danger-button,
+.ghost-button {
+  width: 100%;
+  padding: 0 14px;
+  font-weight: 800;
+}
+
+.primary-button {
+  background: linear-gradient(135deg, var(--purple), var(--purple-2));
+  box-shadow: 0 12px 28px rgba(139, 44, 245, 0.28);
+}
+
+.danger-button {
+  background: rgba(251, 113, 133, 0.14);
+  color: #fecdd3;
+  border: 1px solid rgba(251, 113, 133, 0.36);
+}
+
+.ghost-button {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.league-action-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.league-scorebox {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.league-scorebox .odds,
+.league-scorebox .score-badge,
+.league-scorebox .rank-badge {
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  padding-inline: 4px;
+  font-size: 11px;
+}
+
+.league-icon-action {
+  width: 100%;
+  aspect-ratio: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+}
+
+.whatsapp-button {
+  border: 1px solid rgba(37, 211, 102, 0.3);
+  background: rgba(37, 211, 102, 0.12);
+  box-shadow: 0 10px 24px rgba(37, 211, 102, 0.2);
+}
+
+.bet-image-button {
+  border: 1px solid rgba(185, 108, 255, 0.38);
+  background: linear-gradient(135deg, rgba(139, 44, 245, 0.28), rgba(255, 255, 255, 0.05));
+  box-shadow: 0 12px 28px rgba(139, 44, 245, 0.18);
+}
+
+.bet-image-button img {
+  width: 92%;
+  max-height: 92%;
+  object-fit: contain;
+}
+
+.whatsapp-icon {
+  width: 70%;
+  height: 70%;
+  display: block;
+  object-fit: contain;
+}
+
+.add-users-button {
+  border-color: rgba(185, 108, 255, 0.34);
+  background: rgba(139, 44, 245, 0.14);
+}
+
+.users-plus-icon {
+  width: 38px;
+  height: 38px;
+  fill: none;
+  stroke: #e9d5ff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.leave-league-button {
+  border: 1px solid rgba(251, 113, 133, 0.36);
+  background: rgba(251, 113, 133, 0.12);
+}
+
+.leave-league-icon {
+  width: 38px;
+  height: 38px;
+  fill: none;
+  stroke: #fecdd3;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.text-link {
+  min-height: 36px;
+  padding: 0;
+  border: 0;
+  color: #d8b4fe;
+  background: transparent;
+  font-weight: 800;
+  text-align: center;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  font-weight: 800;
+}
+
+.check-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--purple-2);
+}
+
+.field {
+  display: grid;
+  gap: 7px;
+}
+
+.field label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.field input,
+.field select {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 13px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  outline: none;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: var(--purple-2);
+  box-shadow: 0 0 0 3px rgba(139, 44, 245, 0.18);
+}
+
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  padding: 5px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.ranking-tabs {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  padding: 5px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.segmented label {
+  position: relative;
+}
+
+.segmented input {
+  position: absolute;
+  opacity: 0;
+}
+
+.segmented span {
+  display: grid;
+  min-height: 38px;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.segmented input:checked + span {
+  color: var(--text);
+  background: #2d1a3d;
+}
+
+.loading-box {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  min-height: 160px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.hourglass {
+  font-size: 42px;
+  line-height: 1;
+  animation: flip-hourglass 1.2s infinite ease-in-out;
+}
+
+@keyframes flip-hourglass {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  50% {
+    transform: rotate(180deg);
+  }
+}
+
+.tab {
+  border: 0;
+  min-height: 38px;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font-weight: 800;
+}
+
+.tab.active {
+  color: var(--text);
+  background: #2d1a3d;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.metric {
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.metric strong {
+  display: block;
+  font-size: 18px;
+}
+
+.league-card,
+.candidate-card,
+.person-card,
+.bet-card,
+.member-card,
+.grouped-pick-card,
+.ranking-card {
+  padding: 12px;
+}
+
+.league-card.active {
+  border-color: rgba(185, 108, 255, 0.7);
+}
+
+.league-name,
+.person-name {
+  margin: 0;
+  font-size: 16px;
+}
+
+.odds {
+  padding: 5px 8px;
+  border-radius: 6px;
+  color: #e9d5ff;
+  background: rgba(139, 44, 245, 0.22);
+  border: 1px solid rgba(185, 108, 255, 0.34);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.count-badge {
+  min-width: 32px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  color: #d1fae5;
+  background: rgba(52, 211, 153, 0.12);
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  text-align: center;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.score-badge,
+.rank-badge {
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 900;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.score-badge {
+  color: #d1fae5;
+  background: rgba(52, 211, 153, 0.12);
+  border: 1px solid rgba(52, 211, 153, 0.28);
+}
+
+.rank-badge {
+  color: #fef3c7;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.chip {
+  padding: 6px 9px;
+  border-radius: 999px;
+  color: #e9d5ff;
+  background: rgba(139, 44, 245, 0.14);
+  border: 1px solid rgba(185, 108, 255, 0.22);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.odd-chip {
+  padding: 6px 9px;
+  border-radius: 999px;
+  color: #fef3c7;
+  background: rgba(251, 191, 36, 0.13);
+  border: 1px solid rgba(251, 191, 36, 0.32);
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.status-chip {
+  padding: 6px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.status-chip.alive {
+  color: #bbf7d0;
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.status-chip.dead {
+  color: #e9d5ff;
+  background: rgba(139, 44, 245, 0.18);
+  border: 1px solid rgba(185, 108, 255, 0.34);
+}
+
+.member-chip {
+  padding: 6px 9px;
+  border-radius: 999px;
+  color: #d1fae5;
+  background: rgba(52, 211, 153, 0.1);
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.pick-owner-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.person-card {
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.person-title-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.grouped-pick-card,
+.ranking-card,
+.player-ranking-card {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.player-ranking-card {
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 12px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.025));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.grouped-pick-body {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.grouped-pick-body .between {
+  align-items: flex-start;
+}
+
+.member-card {
+  display: grid;
+  gap: 10px;
+}
+
+.member-card-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.member-picks {
+  display: grid;
+  gap: 7px;
+}
+
+.member-pick-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.join-result-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 48px;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.025));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.join-result-button {
+  width: 48px;
+  height: 48px;
+  border-color: rgba(185, 108, 255, 0.34);
+  background: rgba(139, 44, 245, 0.14);
+}
+
+.join-league-icon {
+  width: 30px;
+  height: 30px;
+  fill: none;
+  stroke: #e9d5ff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.league-enter-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.enter-league-icon {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.member-pick-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-pick-row strong {
+  color: #e9d5ff;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.member-pick-info {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.member-pick-info strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-avatar {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 7px;
+  background: #211629;
+}
+
+@media (max-width: 360px) {
+  .person-card {
+    grid-template-columns: 48px 1fr;
+  }
+
+  .person-card .pick-actions {
+    grid-column: 1 / -1;
+    justify-items: stretch;
+  }
+
+  .grouped-pick-card,
+  .ranking-card {
+    grid-template-columns: 48px 1fr;
+  }
+
+  .member-pick-row {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+}
+
+.pick-actions {
+  display: grid;
+  justify-items: end;
+  gap: 7px;
+}
+
+.delete-pick-button {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid rgba(251, 113, 133, 0.36);
+  border-radius: 6px;
+  color: #fecdd3;
+  background: rgba(251, 113, 133, 0.12);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.avatar {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #211629;
+}
+
+.candidate-card {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 12px;
+  align-items: start;
+}
+
+.candidate-avatar {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #211629;
+}
+
+.candidate-body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bottom-nav {
+  position: fixed;
+  left: 50%;
+  bottom: 0;
+  z-index: 20;
+  width: min(100%, 440px);
+  transform: translateX(-50%);
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  padding: 8px 10px max(8px, env(safe-area-inset-bottom));
+  background: rgba(12, 9, 15, 0.95);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(18px);
+}
+
+.nav-item {
+  display: grid;
+  place-items: center;
+  gap: 3px;
+  min-height: 52px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.nav-item.active {
+  color: var(--text);
+  background: rgba(139, 44, 245, 0.17);
+}
+
+.empty {
+  padding: 22px 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  align-items: end;
+  background: rgba(0, 0, 0, 0.58);
+}
+
+.modal {
+  width: min(100%, 440px);
+  margin: 0 auto;
+  padding: 16px 16px max(16px, env(safe-area-inset-bottom));
+  background: #100b14;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px 8px 0 0;
+}
+
+.modal-back-button {
+  justify-self: start;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 84px;
+  z-index: 50;
+  width: min(calc(100% - 32px), 408px);
+  transform: translateX(-50%);
+  padding: 12px 14px;
+  border-radius: 8px;
+  color: var(--text);
+  background: #22152d;
+  border: 1px solid rgba(185, 108, 255, 0.35);
+  box-shadow: var(--shadow);
+}
+
+.hidden {
+  display: none;
+}
+
+@media (min-width: 760px) {
+  .app-shell {
+    margin-top: 20px;
+    margin-bottom: 20px;
+    min-height: calc(100vh - 40px);
+    border-radius: 22px;
+  }
+
+  .screen {
+    min-height: calc(100vh - 40px);
+  }
+}
