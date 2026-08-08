@@ -1,0 +1,19 @@
+{
+  "name": "NecroBET",
+  "short_name": "NecroBET",
+  "description": "Bolao privado de palpites em formato PWA.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08070a",
+  "theme_color": "#120616",
+  "icons": [
+    {
+      "src": "NecroBET-logo_v3.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

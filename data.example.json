@@ -1,0 +1,14 @@
+{
+  "users": [],
+  "leagues": [],
+  "people": [
+    {
+      "name": "Pessoa Publica Demo",
+      "type": "publica",
+      "image": "NecroBET-logo.png",
+      "source": "demo",
+      "status": "Vivo"
+    }
+  ],
+  "picks": []
+}
